@@ -900,6 +900,44 @@ option = "value"</code></pre>
 5. Commit and push website changes
 6. Push AUR package updates
 
+### Shipping a Release: Sequencing
+
+The order matters as much as the content. Two incidents in the 1.1.0 cycle
+came from sequencing, not from anything on the checklist above.
+
+**Create the GitHub release by hand, immediately after pushing the tag.**
+The build workflows each carry a softprops/action-gh-release step, and
+whichever runs first creates the release with default flags. That is how
+v1.1.0-rc2 briefly shipped marked "latest" with a stub body. Pushing the
+signed tag and then running `gh release create <tag> --verify-tag
+--notes-file <notes>` (with `--prerelease` for rc tags) before any workflow
+finishes means the workflows only ever attach assets. Verify both flags
+afterward: `isPrerelease` on the release, and that `releases/latest` points
+where it should.
+
+**Full ship order:**
+1. Push the signed tag
+2. Create the release by hand with notes and flags (above)
+3. Wait for all tag builds to go green and the full asset set to upload
+4. Only then merge the release branch to `main` - the website deploys from
+   main, and merging earlier publishes download links that 404 until the
+   assets exist
+5. Back-merge to `dev` (the default branch; this is what auto-closes issues)
+6. Cascade the downstream rc/ stack in version order and push it (this is
+   the milestone push - see the branch-push policy)
+7. Close any milestone issues the back-merge did not auto-close, then close
+   the milestone
+8. AUR pushes (sums cross-checked against the CI-signed SHA256SUMS.txt from
+   the release, never against local downloads alone)
+9. Draft announcements for review - never post without approval
+
+**Branch-push policy during development:** every push to an `rc/*` branch
+triggers three workflows, one of which is a ten-variant Docker matrix.
+During active work, push only the release branch under development; keep
+downstream cascade merges local and push the whole stack at milestones.
+Repeated full-stack pushes once queued ~90 runs and starved a tag build for
+hours while a release sat partially uploaded.
+
 ## Website
 
 The website at voxtype.io is hosted via GitHub Pages. It deploys automatically when changes to `website/` are merged to main. No separate deployment step is needed.
