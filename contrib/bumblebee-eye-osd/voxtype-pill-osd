@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+# Force X11/XWayland backend so GNOME completely excludes this window from
+# window-tracking/dock and allows direct override-redirect popup placement
+os.environ['GDK_BACKEND'] = 'x11'
+
+import math
+import time
+import socket
+import struct
+import threading
+import cairo
+import gi
+
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk, GLib
+
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+STATE_FILE = os.path.join(RUNTIME_DIR, "voxtype", "state")
+SOCKET_FILE = os.path.join(RUNTIME_DIR, "voxtype", "audio.sock")
+
+# Faded Minimal Bumblebee Palette
+# Soft, desaturated, luxury-cyber instrumentation
+COLOR_CARBON = (0.06, 0.065, 0.075, 0.94)          # Deep matte slate/obsidian
+COLOR_STEEL = (0.58, 0.62, 0.66)                   # Muted titanium steel
+COLOR_PALE_GOLD = (0.80, 0.72, 0.52)               # Faded champagne / soft warm gold
+COLOR_FADED_ICE = (0.45, 0.72, 0.82)               # Soft misty ice blue / faded cyan
+COLOR_FADED_RED = (0.82, 0.34, 0.38)               # Faded dusty rose / muted crimson
+
+WIN_SIZE = 48
+EYE_RADIUS = 21.0
+TOP_MARGIN = 36  # Floating cleanly just beneath the GNOME top bar
+
+def lerp(c1, c2, factor):
+    """Linear color interpolation helper."""
+    return tuple(c1[i] + (c2[i] - c1[i]) * factor for i in range(len(c1)))
+
+class VoiceReactiveBumblebeeEye(Gtk.Window):
+    def __init__(self):
+        # WindowType.POPUP creates an override-redirect window that is completely
+        # untracked by GNOME Shell / Ubuntu Dock, Alt+Tab, and workspace pagers
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self.set_title("Bumblebee Voice Optic")
+        self.set_decorated(False)
+        self.set_resizable(False)
+
+        # Transparent ARGB visual
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        self.set_app_paintable(True)
+
+        self.update_position()
+
+        # Set empty input shape region so 100% of mouse clicks fall straight through
+        self.connect('map', lambda w: self.input_shape_combine_region(cairo.Region()))
+
+        self.area = Gtk.DrawingArea()
+        self.area.connect('draw', self.draw)
+        self.add(self.area)
+
+        self.current_state = "idle"
+        self.anim_time = 0.0
+        self.tick_count = 0
+
+        # Real-time microphone audio metrics
+        self.raw_voice_level = 0.0
+        self.smooth_voice_level = 0.0
+        self.last_audio_packet_time = 0.0
+        self.shutdown = False
+
+        # Live audio reader thread
+        self.audio_thread = threading.Thread(target=self.audio_socket_loop, daemon=True)
+        self.audio_thread.start()
+
+        # 60 FPS animation loop (16ms)
+        GLib.timeout_add(16, self.tick)
+
+    def update_position(self):
+        """Calculate and apply exact top-center coordinates on current active monitor."""
+        mon_w = 1728
+        mon_x = 0
+        mon_y = 0
+        try:
+            display = Gdk.Display.get_default()
+            if display:
+                seat = display.get_default_seat()
+                pointer = seat.get_pointer()
+                _, px, py = pointer.get_position()
+                monitor = display.get_monitor_at_point(px, py)
+                if not monitor and display.get_n_monitors() > 0:
+                    monitor = display.get_primary_monitor() or display.get_monitor(0)
+                if monitor:
+                    geo = monitor.get_geometry()
+                    mon_w = geo.width
+                    mon_x = geo.x
+                    mon_y = geo.y
+        except Exception:
+            pass
+
+        target_x = mon_x + (mon_w // 2) - (WIN_SIZE // 2)
+        target_y = mon_y + TOP_MARGIN
+        self.set_default_size(WIN_SIZE, WIN_SIZE)
+        self.move(target_x, target_y)
+
+    def audio_socket_loop(self):
+        """Streams real dBFS audio levels directly from Voxtype's audio.sock."""
+        while not self.shutdown:
+            s = None
+            buf = bytearray()
+            try:
+                if not os.path.exists(SOCKET_FILE):
+                    self.raw_voice_level = 0.0
+                    time.sleep(0.2)
+                    continue
+
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(SOCKET_FILE)
+                s.settimeout(0.08)
+                buf.clear()
+
+                while not self.shutdown:
+                    try:
+                        chunk = s.recv(128)
+                        if not chunk:
+                            self.raw_voice_level = 0.0
+                            break
+                        buf.extend(chunk)
+
+                        while len(buf) >= 16:
+                            packet = buf[:16]
+                            del buf[:16]
+                            seq, f1, f2, peak_dbfs = struct.unpack('<Ifff', packet)
+
+                            # Convert peak_dbfs to responsive 0.0 .. 1.0 voice energy
+                            if peak_dbfs < -48.0:
+                                level = 0.0
+                            else:
+                                raw_vol = (peak_dbfs + 48.0) / 48.0
+                                level = min(1.0, max(0.0, raw_vol)) ** 1.2
+
+                            self.raw_voice_level = level
+                            self.last_audio_packet_time = time.time()
+
+                    except socket.timeout:
+                        if time.time() - self.last_audio_packet_time > 0.08:
+                            self.raw_voice_level = 0.0
+            except Exception:
+                self.raw_voice_level = 0.0
+                time.sleep(0.2)
+            finally:
+                buf.clear()
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+    def tick(self):
+        self.tick_count += 1
+
+        # Check state file every ~48ms (every 3rd tick) to prevent 60Hz continuous disk polling
+        if self.tick_count % 3 == 0:
+            new_state = "idle"
+            if os.path.exists(STATE_FILE):
+                try:
+                    with open(STATE_FILE, 'r') as f:
+                        content = f.read().strip().lower()
+                        if content in ("recording", "transcribing"):
+                            new_state = content
+                except Exception:
+                    pass
+
+            if new_state != self.current_state:
+                self.current_state = new_state
+                if self.current_state in ("recording", "transcribing"):
+                    self.update_position()
+                    self.show_all()
+                    self.input_shape_combine_region(cairo.Region())
+                else:
+                    self.hide()
+                    self.raw_voice_level = 0.0
+                    self.smooth_voice_level = 0.0
+
+        if self.get_visible():
+            self.anim_time += 0.025
+
+            # Dynamic Ballistics: Fast snappy attack (0.60), smooth natural decay (0.20)
+            target = self.raw_voice_level if self.current_state == "recording" else 0.0
+            if target > self.smooth_voice_level:
+                self.smooth_voice_level += (target - self.smooth_voice_level) * 0.60
+            else:
+                self.smooth_voice_level += (target - self.smooth_voice_level) * 0.20
+
+            self.area.queue_draw()
+
+        return True
+
+    def draw(self, widget, cr):
+        cr.save()
+        cr.set_operator(cairo.OPERATOR_CLEAR)
+        cr.paint()
+        cr.restore()
+        cr.set_operator(cairo.OPERATOR_OVER)
+
+        cx = WIN_SIZE / 2.0
+        cy = WIN_SIZE / 2.0
+        outer_r = EYE_RADIUS
+        voice = self.smooth_voice_level
+
+        # Combat mode transition when speaking
+        red_factor = min(1.0, (voice / 0.18) ** 0.85) if (self.current_state == "recording" and voice > 0.01) else 0.0
+
+        # Faded minimal color transitions: Soft misty ice -> Faded dusty rose, Pale gold -> Faded rose
+        optic_color = lerp(COLOR_FADED_ICE, COLOR_FADED_RED, red_factor)
+        rim_color = lerp(COLOR_PALE_GOLD, COLOR_FADED_RED, red_factor * 0.70)
+
+        # -------------------------------------------------------------
+        # 1. ARMOR SOCKET (Faded Champagne Rim & Dark Slate Recess)
+        # -------------------------------------------------------------
+        cr.arc(cx, cy, outer_r, 0, 2 * math.pi)
+        cr.set_source_rgba(*COLOR_CARBON)
+        cr.fill_preserve()
+
+        # Faded soft gold armor rim (1.2px)
+        cr.set_source_rgba(rim_color[0], rim_color[1], rim_color[2], 0.65 + 0.20 * voice)
+        cr.set_line_width(1.2)
+        cr.stroke()
+
+        # Subtle inner socket recess
+        cr.arc(cx, cy, outer_r - 1.8, 0, 2 * math.pi)
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.50)
+        cr.set_line_width(0.9)
+        cr.stroke()
+
+        # -------------------------------------------------------------
+        # 2. MECHANICAL STEPPED COLLAR & SERVO NOTCHES
+        # -------------------------------------------------------------
+        collar_r_out = outer_r - 2.8
+        collar_r_in = outer_r - 5.5
+
+        # Concentric metallic tracks
+        cr.arc(cx, cy, collar_r_out, 0, 2 * math.pi)
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.12)
+        cr.set_line_width(0.65)
+        cr.stroke()
+
+        cr.arc(cx, cy, collar_r_in, 0, 2 * math.pi)
+        cr.set_source_rgba(rim_color[0], rim_color[1], rim_color[2], 0.16 + 0.18 * voice)
+        cr.set_line_width(0.55)
+        cr.stroke()
+
+        # 16 Precision Servo Teeth / Calibration Marks around collar
+        num_teeth = 16
+        rot_collar = self.anim_time * 0.20
+        for i in range(num_teeth):
+            angle = (i * 2 * math.pi) / num_teeth + rot_collar
+            is_cardinal = (i % 4 == 0)
+            t_len = 1.7 if is_cardinal else 1.0
+            r_inner = collar_r_out - t_len
+            tx1 = cx + r_inner * math.cos(angle)
+            ty1 = cy + r_inner * math.sin(angle)
+            tx2 = cx + collar_r_out * math.cos(angle)
+            ty2 = cy + collar_r_out * math.sin(angle)
+
+            alpha = 0.55 + 0.25 * voice if is_cardinal else 0.22 + 0.15 * voice
+            tooth_col = lerp(COLOR_STEEL, COLOR_FADED_RED, red_factor * 0.75)
+            cr.set_source_rgba(tooth_col[0], tooth_col[1], tooth_col[2], alpha)
+            cr.set_line_width(0.85 if is_cardinal else 0.60)
+            cr.move_to(tx1, ty1)
+            cr.line_to(tx2, ty2)
+            cr.stroke()
+
+        # -------------------------------------------------------------
+        # 3. LUMINOUS COMPOUND OPTIC (SOFT FADED GLOW)
+        # -------------------------------------------------------------
+        optic_max_r = collar_r_in - 0.5
+
+        # Soft diffused background optic glow
+        opt_grad = cairo.RadialGradient(cx, cy, 1.0, cx, cy, optic_max_r)
+        opt_grad.add_color_stop_rgba(0.0, optic_color[0], optic_color[1], optic_color[2], 0.55 + 0.25 * voice)
+        opt_grad.add_color_stop_rgba(0.65, optic_color[0], optic_color[1], optic_color[2], 0.22 + 0.22 * voice)
+        opt_grad.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, 0.0)
+        cr.arc(cx, cy, optic_max_r, 0, 2 * math.pi)
+        cr.set_source(opt_grad)
+        cr.fill()
+
+        # Radial faceted compound lens ribs
+        num_ribs = 12
+        rot_ribs = self.anim_time * 0.15
+        for i in range(num_ribs):
+            angle = (i * 2 * math.pi) / num_ribs + rot_ribs
+            rx1 = cx + 4.0 * math.cos(angle)
+            ry1 = cy + 4.0 * math.sin(angle)
+            rx2 = cx + optic_max_r * math.cos(angle)
+            ry2 = cy + optic_max_r * math.sin(angle)
+            cr.move_to(rx1, ry1)
+            cr.line_to(rx2, ry2)
+            cr.set_source_rgba(optic_color[0], optic_color[1], optic_color[2], 0.14 + 0.20 * voice)
+            cr.set_line_width(0.60)
+            cr.stroke()
+
+        # -------------------------------------------------------------
+        # 4. ARTICULATED MECHANICAL IRIS / SHUTTER BLADES
+        # -------------------------------------------------------------
+        num_blades = 6
+        blade_outer_r = optic_max_r
+        # Dynamic aperture expands smoothly with speech volume
+        aperture_r = 5.0 + (voice * 7.0)
+        blade_rot = -self.anim_time * 0.35 - (voice * 0.75)
+
+        for i in range(num_blades):
+            a1 = (i * 2 * math.pi) / num_blades + blade_rot
+            a2 = a1 + (2 * math.pi / num_blades) * 1.35
+
+            p1x = cx + aperture_r * math.cos(a1)
+            p1y = cy + aperture_r * math.sin(a1)
+            p2x = cx + blade_outer_r * math.cos(a2)
+            p2y = cy + blade_outer_r * math.sin(a2)
+
+            # Curved blade edge
+            edge_col = lerp(COLOR_STEEL, COLOR_FADED_RED, red_factor * 0.65)
+            cr.set_source_rgba(edge_col[0], edge_col[1], edge_col[2], 0.50 + 0.25 * voice)
+            cr.set_line_width(0.80)
+            cr.move_to(p1x, p1y)
+            cr.line_to(p2x, p2y)
+            cr.stroke()
+
+            # Subtle drop shadow behind blade
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.45)
+            cr.set_line_width(0.65)
+            cr.move_to(p1x + 0.4, p1y + 0.4)
+            cr.line_to(p2x + 0.4, p2y + 0.4)
+            cr.stroke()
+
+        # -------------------------------------------------------------
+        # 5. CENTRAL PROJECTOR DIODE / HIGH-INTENSITY CORE
+        # -------------------------------------------------------------
+        if self.current_state == "transcribing":
+            core_r = 4.8
+            core_grad = cairo.RadialGradient(cx, cy, 0.5, cx, cy, core_r)
+            core_grad.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.90)
+            core_grad.add_color_stop_rgba(0.40, optic_color[0], optic_color[1], optic_color[2], 0.80)
+            core_grad.add_color_stop_rgba(1.0, optic_color[0], optic_color[1], optic_color[2], 0.0)
+            cr.arc(cx, cy, core_r, 0, 2 * math.pi)
+            cr.set_source(core_grad)
+            cr.fill()
+
+            # Faded scanning sweep along the collar ring
+            sweep_angle = (self.anim_time * 8.0) % (2 * math.pi)
+            sweep_r = collar_r_in + 1.2
+            cr.arc(cx, cy, sweep_r, sweep_angle - 1.2, sweep_angle)
+            sweep_grad = cairo.LinearGradient(
+                cx + sweep_r * math.cos(sweep_angle - 1.2),
+                cy + sweep_r * math.sin(sweep_angle - 1.2),
+                cx + sweep_r * math.cos(sweep_angle),
+                cy + sweep_r * math.sin(sweep_angle)
+            )
+            sweep_grad.add_color_stop_rgba(0.0, optic_color[0], optic_color[1], optic_color[2], 0.0)
+            sweep_grad.add_color_stop_rgba(1.0, optic_color[0], optic_color[1], optic_color[2], 0.80)
+            cr.set_source(sweep_grad)
+            cr.set_line_width(1.3)
+            cr.stroke()
+
+            # Leading scanning pip
+            px = cx + sweep_r * math.cos(sweep_angle)
+            py = cy + sweep_r * math.sin(sweep_angle)
+            cr.arc(px, py, 1.1, 0, 2 * math.pi)
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.85)
+            cr.fill()
+        else:
+            # Dynamic focal emitter
+            core_r = 4.0 + (voice * 7.0)
+            core_grad = cairo.RadialGradient(cx, cy, 0.5, cx, cy, core_r)
+
+            white_stop = min(0.60, 0.18 + 0.38 * voice)
+            core_grad.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.95)
+            core_grad.add_color_stop_rgba(white_stop, 1.0, 1.0, 1.0, 0.85)
+            core_grad.add_color_stop_rgba(0.68, optic_color[0], optic_color[1], optic_color[2], 0.90)
+            core_grad.add_color_stop_rgba(1.0, optic_color[0], optic_color[1], optic_color[2], 0.0)
+
+            cr.arc(cx, cy, core_r, 0, 2 * math.pi)
+            cr.set_source(core_grad)
+            cr.fill()
+
+        # -------------------------------------------------------------
+        # 6. SPHERICAL OPTIC LENS & DUAL SPECULAR GLINTS
+        # -------------------------------------------------------------
+        # Primary curved lens reflection
+        glint_r = outer_r - 6.0
+        cr.arc(cx - 2.5, cy - 2.5, glint_r * 0.45, -math.pi * 0.75, -math.pi * 0.15)
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.50)
+        cr.set_line_width(0.85)
+        cr.stroke()
+
+        # Pinpoint micro-glint
+        cr.arc(cx - 3.2, cy - 3.2, 0.75, 0, 2 * math.pi)
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.70)
+        cr.fill()
+
+        return False
+
+if __name__ == "__main__":
+    win = VoiceReactiveBumblebeeEye()
+    Gtk.main()
