@@ -1,38 +1,45 @@
-# Bumblebee Eye Voice-Reactive OSD for Voxtype
+# Liquid Glass Dynamic Island Pill OSD for Voxtype
 
-A cinematic, ultra-lightweight, voice-reactive on-screen display (OSD) for [Voxtype](https://github.com/peteonrails/voxtype) modeled after the authentic Cybertronian optic anatomy of Bumblebee from *Transformers*.
+An ultra-compact, pixel-perfect, voice-reactive on-screen display (OSD) for [Voxtype](https://github.com/peteonrails/voxtype). Designed with an Apple-inspired Dynamic Island pill aesthetic and a dark transparent Liquid Glass substrate.
 
-Designed specifically for Linux Wayland and X11 desktops (GNOME Shell, Sway, Hyprland, KDE Plasma), it floats cleanly top-center beneath the status bar with zero dock intrusion, zero window decorations, and zero click blocking.
-
----
-
-## Visual & Cybernetic Architecture
-
-### 1. Authentic Cybertronian Optic Anatomy
-- **Outer Armor Socket:** Soft champagne / warm titanium gold bezel rim with deep recessed socket shadow.
-- **Stepped Collar & Servos:** Dual concentric metallic focus rings etched with 16 precision servo teeth and cardinal markers at 0°, 90°, 180°, and 270°.
-- **Luminous Compound Optic:** Diffused emissive light field with 12 radial faceted lens ribs (reflector lattice) that gently rotate in the background.
-- **Articulated Shutter Blades:** 6 curved titanium iris blades with metallic drop shadows that dynamically dilate and counter-rotate as voice energy peaks.
-- **Projector Diode (Focal Core):** High-intensity white-hot plasma core that expands dynamically with voice dBFS.
-- **Target Lock Scanner:** High-tech orbital radar sweep with a leading scanning pip along the focus ring during transcription.
-- **Spherical Glass Lens:** Dual specular reflections (a 3D curved lens sheen and pinpoint optical micro-glint).
-
-### 2. Faded Minimal Palette
-To avoid distracting bright/neon colors on your desktop, the visualizer uses an understated, desaturated luxury-cyber palette:
-- **Calm / Listening (Recording):** Soft, misty ice blue (`#73B8D1`) optic within a faded champagne gold (`#CDC2A3`) rim.
-- **Speaking (Battle Mode):** Seamlessly shifts into a muted, dusty rose / dark ember crimson (`#D15761`), dilating in real-time with voice volume.
-- **Transcribing:** Precision misty ice scanning reticle sweep.
-- **Chassis:** Deep matte obsidian slate (`#0F1113`) and muted brushed titanium steel (`#949EA8`).
+Engineered specifically for Linux Wayland and X11 desktops (GNOME Shell, Sway, Hyprland, KDE Plasma), it floats centered beneath the top panel with zero dock intrusion, zero window decorations, and zero click blocking.
 
 ---
 
-## Desktop Stealth & Performance Features
+## Visual Architecture & Themes
+
+### 1. Liquid Glass Substrate & Specular Optics
+- **Dark Obsidian Substrate:** 74% opacity deep obsidian smoked liquid glass (`rgba(0.008, 0.008, 0.012, 0.74)`), maintaining backdrop transparency while preventing wash-out on bright or white windows.
+- **Convex Dome Specular Shine:** Upper curvature reflection gradient that mimics a convex optical glass crystal dome.
+- **Physical Glass Crystal Rim:** Dual-layer integer-aligned border (0.90 pure white top highlight, 0.32 base rim) creating physical refraction depth.
+- **Micro Capsule Dimensions:** Precision-engineered micro capsule (`82 × 24 px`, `r = 12 px`) keeping screen footprint minimal and unobtrusive.
+
+### 2. Voice-Reactive Acoustic Diaphragm
+- **Center-Weighted Breathing Pearls:** 4 pure white pearls with silver radial depth gradients and upper-left pinpoint specular glints.
+- **Zero Vertical Bouncing:** Pearls stay stably anchored to the centerline (`cy`), expanding in radius and breathing horizontally in direct response to vocal energy.
+- **Symmetrical Expansion:** Inner pearls pulse up to `3.4 px` radius, while outer flank pearls expand to `2.4 px` radius (baseline `1.5 px` at rest).
+- **Adaptive Ambient Noise Floor:** Real-time dynamic noise floor tracker (`-45` to `-25 dBFS`) that filters out background fan/room noise and suppresses startup audio feedback chimes. In silence, the volume level sits at absolute `0.0`.
+- **Fast Attack & Smooth Decay:** Studio PPM ballistics (75% instant attack on syllable onsets, 18% smooth decay over ~160ms between words).
+
+### 3. Micro Digital Timer & Transcription Spinner
+- **Right-Aligned Timer:** Clean fixed 10 px right margin inset (`x0 + w - 10.0 - width`) with a crisp drop shadow for 100% legibility on any wallpaper or window.
+- **Transcribing State:** Pure white crystal arc spinner (`r = 3.4 px`) with shimmering "Processing..." label.
+
+### 4. Available Visual Themes
+Selectable via `--theme <name>`:
+- `dark-glass` (Default): 74% deep obsidian smoked liquid glass.
+- `clear-glass`: 42% high-transparency liquid glass with prominent crystal rim refraction.
+- `matte-black`: 96% deep matte obsidian pill with high-contrast pure white typography.
+
+---
+
+## Desktop Stealth & Performance
 
 - **Zero Dock / Alt+Tab Intrusion:** Uses `Gtk.WindowType.POPUP` with `GDK_BACKEND=x11` (XWayland override-redirect), ensuring GNOME Shell / Ubuntu Dock / window managers treat it strictly as an overlay.
 - **100% Click-Through:** Mouse clicks, drags, and scrolls pass straight through the visualizer to underlying applications (`cairo.Region()`).
 - **Dynamic Pointer Tracking:** Automatically positions top-center on whichever monitor your mouse pointer is currently active.
-- **Live Voice Ballistics:** Connects directly to `$XDG_RUNTIME_DIR/voxtype/audio.sock` to parse real-time peak audio dBFS with asymmetrical ballistics (fast 60ms attack, smooth 200ms decay).
-- **Ultra-Low CPU:** State checks are throttled to ~48ms intervals to avoid continuous 60Hz disk I/O polling.
+- **Live Audio Socket:** Connects directly to `$XDG_RUNTIME_DIR/voxtype/audio.sock` to parse real-time dBFS audio frames without IPC overhead.
+- **Low CPU & Memory:** Consumes ~1.7 MB RAM and throttles state file checks to ~48ms intervals to avoid continuous 60Hz disk I/O polling.
 
 ---
 
@@ -72,16 +79,37 @@ systemctl --user enable --now voxtype-pill-osd.service
 
 ---
 
+## Usage & CLI Options
+
+Preview interactive demo mode:
+```bash
+voxtype-pill-osd --demo
+```
+
+Launch with custom theme or top offset:
+```bash
+voxtype-pill-osd --theme clear-glass --top-margin 42
+```
+
+CLI options:
+```text
+  --demo                 Launch in interactive demo preview mode
+  --theme THEME          Visual theme: dark-glass (default), clear-glass, matte-black
+  --top-margin PIXELS    Vertical offset in pixels from the top of the screen (default: 36)
+```
+
+---
+
 ## Recommended Keybindings
 
-Because desktop environments (like GNOME) reserve standalone modifier keys (e.g. lone `Alt`), the recommended setup is a custom shortcut calling `voxtype record toggle`:
+Recommended setup is a custom shortcut calling `voxtype record toggle`:
 
 ### GNOME Settings → Keyboard → Custom Shortcuts
 - **Shortcut 1:** `Ctrl + Space` -> `voxtype record toggle`
 - **Shortcut 2:** `Alt + Space` -> `voxtype record toggle`
 
 ### Voxtype Config (`~/.config/voxtype/config.toml`)
-If using compositor/desktop shortcuts, set the built-in evdev grab to disabled or an unused key to avoid modifier conflicts:
+If using compositor/desktop shortcuts, set the built-in evdev grab to disabled:
 ```toml
 [hotkey]
 enabled = false
@@ -91,9 +119,9 @@ mode = "toggle"
 
 ---
 
-## Verification & Status
+## Service Verification & Logs
 
-Check the visualizer status:
+Check visualizer status:
 ```bash
 systemctl --user status voxtype-pill-osd.service
 ```

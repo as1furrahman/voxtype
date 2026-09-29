@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DEST="${HOME}/.local/bin"
 SERVICE_DEST="${HOME}/.config/systemd/user"
 
-echo "=== Installing Voxtype Bumblebee Eye OSD ==="
+echo "=== Installing Voxtype Liquid Glass Pill OSD ==="
 
 # 1. Check Python dependencies
 echo "Checking dependencies..."
@@ -36,5 +36,5 @@ systemctl --user daemon-reload
 systemctl --user enable --now voxtype-pill-osd.service
 
 echo ""
-echo "=== Bumblebee Eye OSD installed and running successfully! ==="
+echo "=== Voxtype Liquid Glass Pill OSD installed and running successfully! ==="
 systemctl --user status voxtype-pill-osd.service --no-pager

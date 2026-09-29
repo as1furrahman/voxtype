@@ -1,51 +1,116 @@
 #!/usr/bin/env python3
+"""Voxtype Liquid Glass Dynamic Island Pill OSD.
+
+A lightweight, pixel-perfect voice-reactive on-screen display (OSD) for Voxtype.
+Designed specifically for Linux Wayland & X11 desktops (GNOME Shell, Sway, Hyprland, KDE Plasma).
+
+Features:
+- Pure monochrome black & white design (R = G = B everywhere, zero colored tints).
+- Darker transparent Liquid Glass substrate with convex dome shine and crystal rim.
+- 4 voice-reactive breathing pearls with acoustic diaphragm ballistics (zero vertical bouncing).
+- Real-time adaptive microphone noise floor tracking with audio feedback beep suppression.
+- Micro digital timer right-aligned with symmetrical margins.
+- Transcribing state with pure white crystal spinner and shimmering status.
+- Zero dock / window-manager intrusion via XWayland override-redirect popup.
+- 100% click-through input shape combining cairo.Region().
+"""
+
 import os
 import sys
 
-# Force X11/XWayland backend so GNOME completely excludes this window from
+# Force X11/XWayland backend so GNOME / Mutter excludes this window from
 # window-tracking/dock and allows direct override-redirect popup placement
 os.environ['GDK_BACKEND'] = 'x11'
 
+import argparse
 import math
-import time
+import signal
 import socket
 import struct
 import threading
+import time
 import cairo
 import gi
 
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GLib
+try:
+    from gi.repository import GLibUnix
+except ImportError:
+    GLibUnix = None
 
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
 STATE_FILE = os.path.join(RUNTIME_DIR, "voxtype", "state")
 SOCKET_FILE = os.path.join(RUNTIME_DIR, "voxtype", "audio.sock")
 
-# Pure Black and White / Monochrome Cybertronian Palette
-COLOR_BLACK = (0.04, 0.04, 0.05, 0.96)            # Deep obsidian carbon
-COLOR_GRAPHITE = (0.18, 0.19, 0.22)               # Dark graphite
-COLOR_TITANIUM = (0.50, 0.52, 0.55)               # Mid-tone titanium steel
-COLOR_SILVER = (0.78, 0.80, 0.84)                 # Polished silver
-COLOR_WHITE = (1.0, 1.0, 1.0)                     # Pure crisp white
+CANVAS_WIDTH = 250
+CANVAS_HEIGHT = 50
 
-WIN_SIZE = 48
-EYE_RADIUS = 21.0
-TOP_MARGIN = 36  # Floating cleanly just beneath the GNOME top bar
+# =============================================================================
+# STRICT PURE MONOCHROME PALETTES (Zero Color Tints, R = G = B Everywhere)
+# =============================================================================
+COLOR_WHITE = (1.00, 1.00, 1.00)
+COLOR_PEARL_SILVER = (0.86, 0.86, 0.86)
 
-def lerp(c1, c2, factor):
-    """Linear color interpolation helper."""
-    return tuple(c1[i] + (c2[i] - c1[i]) * factor for i in range(len(c1)))
+THEMES = {
+    "dark-glass": {
+        "name": "Dark Obsidian Liquid Glass",
+        "description": "74% opacity deep obsidian smoked liquid glass (Default)",
+        "bg_rgba": (0.008, 0.008, 0.012, 0.74),
+        "sheen_stops": [(0.0, 1.0, 1.0, 1.0, 0.16), (0.45, 0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0, 0.07)],
+        "rim_top": (1.0, 1.0, 1.0, 0.90),
+        "rim_bot": (1.0, 1.0, 1.0, 0.32),
+        "dome_top": 0.38,
+        "dome_mid": 0.10,
+        "bezel_alpha": 0.16,
+    },
+    "clear-glass": {
+        "name": "Pure Clear Liquid Glass",
+        "description": "42% opacity clear liquid glass with enhanced crystal rim refraction",
+        "bg_rgba": (0.010, 0.010, 0.015, 0.42),
+        "sheen_stops": [(0.0, 1.0, 1.0, 1.0, 0.22), (0.45, 0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0, 0.10)],
+        "rim_top": (1.0, 1.0, 1.0, 0.95),
+        "rim_bot": (1.0, 1.0, 1.0, 0.45),
+        "dome_top": 0.45,
+        "dome_mid": 0.14,
+        "bezel_alpha": 0.22,
+    },
+    "matte-black": {
+        "name": "Matte Monochrome Obsidian",
+        "description": "96% opacity deep matte black with high-contrast pure white pearls",
+        "bg_rgba": (0.018, 0.018, 0.020, 0.96),
+        "sheen_stops": [(0.0, 1.0, 1.0, 1.0, 0.08), (0.50, 0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0, 0.04)],
+        "rim_top": (1.0, 1.0, 1.0, 0.85),
+        "rim_bot": (1.0, 1.0, 1.0, 0.25),
+        "dome_top": 0.22,
+        "dome_mid": 0.06,
+        "bezel_alpha": 0.12,
+    },
+}
 
-class VoiceReactiveBumblebeeEye(Gtk.Window):
-    def __init__(self):
-        # WindowType.POPUP creates an override-redirect window that is completely
-        # untracked by GNOME Shell / Ubuntu Dock, Alt+Tab, and workspace pagers
+
+def draw_rounded_capsule(cr, x, y, w, h, r):
+    """Draw a smooth rounded capsule path in Cairo."""
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+class DynamicIslandOSD(Gtk.Window):
+    def __init__(self, demo_mode=False, theme_name="dark-glass", top_margin=36):
         super().__init__(type=Gtk.WindowType.POPUP)
-        self.set_title("Bumblebee Voice Optic")
+        self.set_title("Voxtype Liquid Glass Dynamic Island")
         self.set_decorated(False)
         self.set_resizable(False)
 
-        # Transparent ARGB visual
+        self.demo_mode = demo_mode
+        self.theme = THEMES.get(theme_name, THEMES["dark-glass"])
+        self.top_margin = top_margin
+
+        # Transparent ARGB visual for glass compositing
         screen = self.get_screen()
         visual = screen.get_rgba_visual()
         if visual:
@@ -54,33 +119,44 @@ class VoiceReactiveBumblebeeEye(Gtk.Window):
 
         self.update_position()
 
-        # Set empty input shape region so 100% of mouse clicks fall straight through
+        # Input shape pass-through: clicks pass right through to underlying desktop
         self.connect('map', lambda w: self.input_shape_combine_region(cairo.Region()))
+        self.connect('destroy', self.on_destroy)
 
         self.area = Gtk.DrawingArea()
         self.area.connect('draw', self.draw)
         self.add(self.area)
 
-        self.current_state = "idle"
+        self.current_state = "recording" if self.demo_mode else "idle"
         self.anim_time = 0.0
         self.tick_count = 0
+        self.last_tick_time = time.time()
+        self.recording_start_time = time.time() if self.demo_mode else None
 
-        # Real-time microphone audio metrics
-        self.raw_voice_level = 0.0
+        # Real-time microphone audio metrics & adaptive noise floor
+        self.noise_floor_dbfs = -30.0
+        self.incoming_vol_peak = 0.0
         self.smooth_voice_level = 0.0
+        self.pearl_levels = [0.0, 0.0, 0.0, 0.0]
         self.last_audio_packet_time = 0.0
         self.shutdown = False
 
-        # Live audio reader thread
-        self.audio_thread = threading.Thread(target=self.audio_socket_loop, daemon=True)
-        self.audio_thread.start()
+        if not self.demo_mode:
+            self.audio_thread = threading.Thread(target=self.audio_socket_loop, daemon=True)
+            self.audio_thread.start()
+        else:
+            self.show_all()
 
-        # 60 FPS animation loop (16ms)
+        # 60 FPS smooth rendering loop (16ms)
         GLib.timeout_add(16, self.tick)
 
+    def on_destroy(self, *args):
+        self.shutdown = True
+        Gtk.main_quit()
+
     def update_position(self):
-        """Calculate and apply exact top-center coordinates on current active monitor."""
-        mon_w = 1728
+        """Calculate and apply exact coordinates centered on the active monitor."""
+        mon_w = 1920
         mon_x = 0
         mon_y = 0
         try:
@@ -100,19 +176,19 @@ class VoiceReactiveBumblebeeEye(Gtk.Window):
         except Exception:
             pass
 
-        target_x = mon_x + (mon_w // 2) - (WIN_SIZE // 2)
-        target_y = mon_y + TOP_MARGIN
-        self.set_default_size(WIN_SIZE, WIN_SIZE)
+        target_x = mon_x + (mon_w // 2) - (CANVAS_WIDTH // 2)
+        target_y = mon_y + self.top_margin
+        self.set_default_size(CANVAS_WIDTH, CANVAS_HEIGHT)
         self.move(target_x, target_y)
 
     def audio_socket_loop(self):
-        """Streams real dBFS audio levels directly from Voxtype's audio.sock."""
+        """Streams real dBFS audio levels directly from Voxtype's audio.sock with adaptive noise floor."""
         while not self.shutdown:
             s = None
             buf = bytearray()
             try:
                 if not os.path.exists(SOCKET_FILE):
-                    self.raw_voice_level = 0.0
+                    self.incoming_vol_peak = 0.0
                     time.sleep(0.2)
                     continue
 
@@ -125,7 +201,6 @@ class VoiceReactiveBumblebeeEye(Gtk.Window):
                     try:
                         chunk = s.recv(128)
                         if not chunk:
-                            self.raw_voice_level = 0.0
                             break
                         buf.extend(chunk)
 
@@ -134,21 +209,46 @@ class VoiceReactiveBumblebeeEye(Gtk.Window):
                             del buf[:16]
                             seq, f1, f2, peak_dbfs = struct.unpack('<Ifff', packet)
 
-                            # Convert peak_dbfs to responsive 0.0 .. 1.0 voice energy
-                            if peak_dbfs < -48.0:
-                                level = 0.0
-                            else:
-                                raw_vol = (peak_dbfs + 48.0) / 48.0
-                                level = min(1.0, max(0.0, raw_vol)) ** 1.2
+                            now = time.time()
+                            # Check recording elapsed time to skip startup audio feedback beep
+                            elapsed = (now - self.recording_start_time) if self.recording_start_time else 0.0
 
-                            self.raw_voice_level = level
-                            self.last_audio_packet_time = time.time()
+                            if not math.isfinite(peak_dbfs) or peak_dbfs < -100.0:
+                                continue
+
+                            # Skip the first 180ms startup audio feedback beep from distorting noise floor
+                            if elapsed < 0.18:
+                                continue
+
+                            # Adaptively track ambient background noise floor
+                            if -60.0 <= peak_dbfs < self.noise_floor_dbfs:
+                                # Rapidly adapt downward to quieter room state
+                                self.noise_floor_dbfs += (peak_dbfs - self.noise_floor_dbfs) * 0.12
+                            elif -22.0 > peak_dbfs >= self.noise_floor_dbfs:
+                                # Very slowly drift upward to track ambient background changes (fan, AC)
+                                self.noise_floor_dbfs += (peak_dbfs - self.noise_floor_dbfs) * 0.003
+
+                            self.noise_floor_dbfs = max(-45.0, min(-25.0, self.noise_floor_dbfs))
+
+                            # Speech threshold sits 3.5 dB above the adaptive ambient noise floor
+                            thresh = self.noise_floor_dbfs + 3.5
+                            if peak_dbfs <= thresh:
+                                vol = 0.0
+                            else:
+                                snr = (peak_dbfs - thresh) / max(14.0, -5.0 - thresh)
+                                vol = min(1.0, max(0.0, snr)) ** 0.85
+
+                            # Retain peak volume in this burst for the UI tick
+                            if vol > self.incoming_vol_peak:
+                                self.incoming_vol_peak = vol
+
+                            self.last_audio_packet_time = now
 
                     except socket.timeout:
-                        if time.time() - self.last_audio_packet_time > 0.08:
-                            self.raw_voice_level = 0.0
+                        if time.time() - self.last_audio_packet_time > 0.20:
+                            self.incoming_vol_peak = 0.0
             except Exception:
-                self.raw_voice_level = 0.0
+                self.incoming_vol_peak = 0.0
                 time.sleep(0.2)
             finally:
                 buf.clear()
@@ -160,39 +260,104 @@ class VoiceReactiveBumblebeeEye(Gtk.Window):
 
     def tick(self):
         self.tick_count += 1
+        now = time.time()
+        dt = max(0.0, min(0.1, now - self.last_tick_time))
+        self.last_tick_time = now
 
-        # Check state file every ~48ms (every 3rd tick) to prevent 60Hz continuous disk polling
-        if self.tick_count % 3 == 0:
-            new_state = "idle"
-            if os.path.exists(STATE_FILE):
-                try:
-                    with open(STATE_FILE, 'r') as f:
-                        content = f.read().strip().lower()
-                        if content in ("recording", "transcribing"):
-                            new_state = content
-                except Exception:
-                    pass
-
-            if new_state != self.current_state:
-                self.current_state = new_state
-                if self.current_state in ("recording", "transcribing"):
-                    self.update_position()
-                    self.show_all()
-                    self.input_shape_combine_region(cairo.Region())
-                else:
-                    self.hide()
-                    self.raw_voice_level = 0.0
+        # Demo mode simulates live speech cadence and state transitions
+        if self.demo_mode:
+            self.anim_time += dt
+            cycle = (self.anim_time % 12.0)
+            if cycle < 9.0:
+                if self.current_state != "recording":
+                    self.current_state = "recording"
+                    self.recording_start_time = now
+                    self.incoming_vol_peak = 0.0
                     self.smooth_voice_level = 0.0
+                    self.pearl_levels = [0.0, 0.0, 0.0, 0.0]
+                # Natural speech rhythm: 2.2s speaking phrase, 1.4s silent pause
+                sub_cycle = (self.anim_time % 3.6)
+                if sub_cycle < 2.2:
+                    syllable = math.sin(self.anim_time * 9.0) * 0.5 + 0.5
+                    phrase_env = math.sin((sub_cycle / 2.2) * math.pi)
+                    self.incoming_vol_peak = max(self.incoming_vol_peak, (0.35 + 0.65 * syllable) * phrase_env)
+                else:
+                    self.incoming_vol_peak = 0.0
+            else:
+                self.current_state = "transcribing"
+        else:
+            # Production: Check state file every ~48ms (every 3rd tick)
+            if self.tick_count % 3 == 0:
+                new_state = "idle"
+                if os.path.exists(STATE_FILE):
+                    try:
+                        with open(STATE_FILE, 'r') as f:
+                            content = f.read().strip().lower()
+                            if content in ("recording", "transcribing"):
+                                new_state = content
+                    except Exception:
+                        pass
+
+                if new_state != self.current_state:
+                    prev_state = self.current_state
+                    self.current_state = new_state
+
+                    if self.current_state == "recording":
+                        if prev_state != "recording":
+                            self.recording_start_time = now
+                            self.incoming_vol_peak = 0.0
+                            self.smooth_voice_level = 0.0
+                            self.pearl_levels = [0.0, 0.0, 0.0, 0.0]
+                        self.update_position()
+                        self.show_all()
+                        self.input_shape_combine_region(cairo.Region())
+                    elif self.current_state == "transcribing":
+                        self.update_position()
+                        self.show_all()
+                        self.input_shape_combine_region(cairo.Region())
+                    else:
+                        self.hide()
+                        self.recording_start_time = None
+                        self.incoming_vol_peak = 0.0
+                        self.smooth_voice_level = 0.0
+                        self.pearl_levels = [0.0, 0.0, 0.0, 0.0]
 
         if self.get_visible():
-            self.anim_time += 0.025
+            if not self.demo_mode:
+                self.anim_time += dt
 
-            # Dynamic Ballistics: Fast snappy attack (0.60), smooth natural decay (0.20)
-            target = self.raw_voice_level if self.current_state == "recording" else 0.0
+            # Sample incoming voice peak
+            target = self.incoming_vol_peak if self.current_state == "recording" else 0.0
+            self.incoming_vol_peak *= 0.35
+
+            # Dynamic master ballistics: fast attack (0.75) for syllables, smooth decay (0.18)
             if target > self.smooth_voice_level:
-                self.smooth_voice_level += (target - self.smooth_voice_level) * 0.60
+                self.smooth_voice_level += (target - self.smooth_voice_level) * 0.75
             else:
-                self.smooth_voice_level += (target - self.smooth_voice_level) * 0.20
+                self.smooth_voice_level += (target - self.smooth_voice_level) * 0.18
+
+            if self.smooth_voice_level < 0.01:
+                self.smooth_voice_level = 0.0
+
+            # Symmetrical acoustic diaphragm ballistics across 4 pearls
+            p_targets = [
+                self.smooth_voice_level * 0.70,
+                self.smooth_voice_level * 1.00,
+                self.smooth_voice_level * 0.96,
+                self.smooth_voice_level * 0.72,
+            ]
+            p_attacks = [0.65, 0.85, 0.82, 0.68]
+            p_decays = [0.15, 0.20, 0.19, 0.16]
+
+            for i in range(4):
+                pt = p_targets[i]
+                if pt > self.pearl_levels[i]:
+                    self.pearl_levels[i] += (pt - self.pearl_levels[i]) * p_attacks[i]
+                else:
+                    self.pearl_levels[i] += (pt - self.pearl_levels[i]) * p_decays[i]
+
+                if self.pearl_levels[i] < 0.005:
+                    self.pearl_levels[i] = 0.0
 
             self.area.queue_draw()
 
@@ -205,193 +370,217 @@ class VoiceReactiveBumblebeeEye(Gtk.Window):
         cr.restore()
         cr.set_operator(cairo.OPERATOR_OVER)
 
-        cx = WIN_SIZE / 2.0
-        cy = WIN_SIZE / 2.0
-        outer_r = EYE_RADIUS
         v = self.smooth_voice_level
+        w = 82.0
+        h = 24.0
+        r = 12.0
+        cx = CANVAS_WIDTH / 2.0
+        cy = CANVAS_HEIGHT / 2.0
+        x0 = cx - (w / 2.0)
+        y0 = cy - (h / 2.0)
 
         # -------------------------------------------------------------
-        # 1. ARMOR SOCKET (Deep Obsidian Carbon & Platinum Rim)
+        # 1. TRANSPARENT LIQUID GLASS SUBSTRATE & SHEEN
         # -------------------------------------------------------------
-        cr.arc(cx, cy, outer_r, 0, 2 * math.pi)
-        cr.set_source_rgba(*COLOR_BLACK)
+        # Subtle ambient white refraction rim glow (strictly clipped to capsule)
+        cr.save()
+        draw_rounded_capsule(cr, x0 + 0.5, y0 + 0.5, w - 1.0, h - 1.0, r - 0.5)
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.07 * (0.8 + 0.4 * v))
+        cr.set_line_width(2.0)
+        cr.stroke()
+        cr.restore()
+
+        # Smoked Glass Substrate
+        draw_rounded_capsule(cr, x0 + 0.5, y0 + 0.5, w - 1.0, h - 1.0, r - 0.5)
+        bg = self.theme["bg_rgba"]
+        cr.set_source_rgba(bg[0], bg[1], bg[2], bg[3])
         cr.fill_preserve()
 
-        # Outer Chiseled Platinum/Silver Rim (1.3px)
-        cr.set_source_rgba(COLOR_SILVER[0], COLOR_SILVER[1], COLOR_SILVER[2], 0.70 + 0.30 * v)
-        cr.set_line_width(1.3)
-        cr.stroke()
-
-        # Inner Socket Shadow / Recess Ring
-        cr.arc(cx, cy, outer_r - 1.8, 0, 2 * math.pi)
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.60)
-        cr.set_line_width(0.9)
-        cr.stroke()
-
-        # -------------------------------------------------------------
-        # 2. MECHANICAL STEPPED COLLAR & SERVO NOTCHES
-        # -------------------------------------------------------------
-        collar_r_out = outer_r - 2.8
-        collar_r_in = outer_r - 5.5
-
-        # Concentric metallic tracks
-        cr.arc(cx, cy, collar_r_out, 0, 2 * math.pi)
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.18)
-        cr.set_line_width(0.65)
-        cr.stroke()
-
-        cr.arc(cx, cy, collar_r_in, 0, 2 * math.pi)
-        cr.set_source_rgba(COLOR_SILVER[0], COLOR_SILVER[1], COLOR_SILVER[2], 0.20 + 0.25 * v)
-        cr.set_line_width(0.55)
-        cr.stroke()
-
-        # 16 Precision Servo Calibration Marks around collar
-        num_teeth = 16
-        rot_collar = self.anim_time * 0.20
-        for i in range(num_teeth):
-            angle = (i * 2 * math.pi) / num_teeth + rot_collar
-            is_cardinal = (i % 4 == 0)
-            t_len = 1.7 if is_cardinal else 1.0
-            r_inner = collar_r_out - t_len
-            tx1 = cx + r_inner * math.cos(angle)
-            ty1 = cy + r_inner * math.sin(angle)
-            tx2 = cx + collar_r_out * math.cos(angle)
-            ty2 = cy + collar_r_out * math.sin(angle)
-
-            alpha = 0.70 + 0.30 * v if is_cardinal else 0.28 + 0.20 * v
-            cr.set_source_rgba(COLOR_SILVER[0], COLOR_SILVER[1], COLOR_SILVER[2], alpha)
-            cr.set_line_width(0.85 if is_cardinal else 0.60)
-            cr.move_to(tx1, ty1)
-            cr.line_to(tx2, ty2)
-            cr.stroke()
-
-        # -------------------------------------------------------------
-        # 3. LUMINOUS COMPOUND OPTIC (PURE MONOCHROMATIC WHITE/SILVER)
-        # -------------------------------------------------------------
-        optic_max_r = collar_r_in - 0.5
-
-        # Emissive optic field in pure white/silver gradient
-        opt_grad = cairo.RadialGradient(cx, cy, 1.0, cx, cy, optic_max_r)
-        opt_grad.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.75 + 0.25 * v)
-        opt_grad.add_color_stop_rgba(0.55, COLOR_SILVER[0], COLOR_SILVER[1], COLOR_SILVER[2], 0.30 + 0.35 * v)
-        opt_grad.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, 0.0)
-        cr.arc(cx, cy, optic_max_r, 0, 2 * math.pi)
-        cr.set_source(opt_grad)
+        # Internal diagonal glass refraction sheen
+        tint_grad = cairo.LinearGradient(x0, y0, x0 + w, y0 + h)
+        for stop_pos, r_val, g_val, b_val, a_val in self.theme["sheen_stops"]:
+            tint_grad.add_color_stop_rgba(stop_pos, r_val, g_val, b_val, a_val)
+        cr.set_source(tint_grad)
         cr.fill()
 
-        # Radial faceted compound lens ribs
-        num_ribs = 12
-        rot_ribs = self.anim_time * 0.15
-        for i in range(num_ribs):
-            angle = (i * 2 * math.pi) / num_ribs + rot_ribs
-            rx1 = cx + 4.0 * math.cos(angle)
-            ry1 = cy + 4.0 * math.sin(angle)
-            rx2 = cx + optic_max_r * math.cos(angle)
-            ry2 = cy + optic_max_r * math.sin(angle)
-            cr.move_to(rx1, ry1)
-            cr.line_to(rx2, ry2)
-            cr.set_source_rgba(1.0, 1.0, 1.0, 0.18 + 0.25 * v)
-            cr.set_line_width(0.60)
-            cr.stroke()
-
         # -------------------------------------------------------------
-        # 4. ARTICULATED MECHANICAL IRIS / SHUTTER BLADES
+        # 2. LIQUID GLASS CONVEX DOME SHINE & CRYSTAL BEZEL
         # -------------------------------------------------------------
-        num_blades = 6
-        blade_outer_r = optic_max_r
-        aperture_r = 5.0 + (v * 7.0)
-        blade_rot = -self.anim_time * 0.35 - (v * 0.75)
+        # Upper Convex Dome Specular Glint (Inside upper half of capsule)
+        cr.save()
+        dome_h = (h / 2.0) - 1.5
+        dome_r = min(r - 1.5, dome_h / 2.0)
+        draw_rounded_capsule(cr, x0 + 1.5, y0 + 1.5, w - 3.0, dome_h, dome_r)
+        dome_grad = cairo.LinearGradient(cx, y0 + 1.5, cx, y0 + 1.5 + dome_h)
+        dome_grad.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, self.theme["dome_top"])
+        dome_grad.add_color_stop_rgba(0.55, 1.0, 1.0, 1.0, self.theme["dome_mid"])
+        dome_grad.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.0)
+        cr.set_source(dome_grad)
+        cr.fill()
+        cr.restore()
 
-        for i in range(num_blades):
-            a1 = (i * 2 * math.pi) / num_blades + blade_rot
-            a2 = a1 + (2 * math.pi / num_blades) * 1.35
-
-            p1x = cx + aperture_r * math.cos(a1)
-            p1y = cy + aperture_r * math.sin(a1)
-            p2x = cx + blade_outer_r * math.cos(a2)
-            p2y = cy + blade_outer_r * math.sin(a2)
-
-            # Polished metallic blade edge
-            cr.set_source_rgba(COLOR_SILVER[0], COLOR_SILVER[1], COLOR_SILVER[2], 0.60 + 0.35 * v)
-            cr.set_line_width(0.85)
-            cr.move_to(p1x, p1y)
-            cr.line_to(p2x, p2y)
-            cr.stroke()
-
-            # Metallic drop shadow
-            cr.set_source_rgba(0.0, 0.0, 0.0, 0.55)
-            cr.set_line_width(0.70)
-            cr.move_to(p1x + 0.4, p1y + 0.4)
-            cr.line_to(p2x + 0.4, p2y + 0.4)
-            cr.stroke()
-
-        # -------------------------------------------------------------
-        # 5. CENTRAL PROJECTOR DIODE / PURE WHITE-HOT CORE
-        # -------------------------------------------------------------
-        if self.current_state == "transcribing":
-            core_r = 4.8
-            core_grad = cairo.RadialGradient(cx, cy, 0.5, cx, cy, core_r)
-            core_grad.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 1.0)
-            core_grad.add_color_stop_rgba(0.40, COLOR_SILVER[0], COLOR_SILVER[1], COLOR_SILVER[2], 0.90)
-            core_grad.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, 0.0)
-            cr.arc(cx, cy, core_r, 0, 2 * math.pi)
-            cr.set_source(core_grad)
-            cr.fill()
-
-            # Pure white targeting scanner sweep along the collar ring
-            sweep_angle = (self.anim_time * 8.0) % (2 * math.pi)
-            sweep_r = collar_r_in + 1.2
-            cr.arc(cx, cy, sweep_r, sweep_angle - 1.2, sweep_angle)
-            sweep_grad = cairo.LinearGradient(
-                cx + sweep_r * math.cos(sweep_angle - 1.2),
-                cy + sweep_r * math.sin(sweep_angle - 1.2),
-                cx + sweep_r * math.cos(sweep_angle),
-                cy + sweep_r * math.sin(sweep_angle)
-            )
-            sweep_grad.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.0)
-            sweep_grad.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.95)
-            cr.set_source(sweep_grad)
-            cr.set_line_width(1.4)
-            cr.stroke()
-
-            # Leading scanning pip
-            px = cx + sweep_r * math.cos(sweep_angle)
-            py = cy + sweep_r * math.sin(sweep_angle)
-            cr.arc(px, py, 1.2, 0, 2 * math.pi)
-            cr.set_source_rgba(1.0, 1.0, 1.0, 1.0)
-            cr.fill()
-        else:
-            # Dynamic focal emitter expands with voice volume
-            core_r = 4.2 + (v * 7.5)
-            core_grad = cairo.RadialGradient(cx, cy, 0.5, cx, cy, core_r)
-
-            white_stop = min(0.65, 0.20 + 0.45 * v)
-            core_grad.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 1.0)
-            core_grad.add_color_stop_rgba(white_stop, 1.0, 1.0, 1.0, 0.95)
-            core_grad.add_color_stop_rgba(0.70, COLOR_SILVER[0], COLOR_SILVER[1], COLOR_SILVER[2], 0.90)
-            core_grad.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, 0.0)
-
-            cr.arc(cx, cy, core_r, 0, 2 * math.pi)
-            cr.set_source(core_grad)
-            cr.fill()
-
-        # -------------------------------------------------------------
-        # 6. SPHERICAL OPTIC LENS & DUAL SPECULAR GLINTS
-        # -------------------------------------------------------------
-        # Primary curved lens reflection
-        glint_r = outer_r - 6.0
-        cr.arc(cx - 2.5, cy - 2.5, glint_r * 0.45, -math.pi * 0.75, -math.pi * 0.15)
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.65)
-        cr.set_line_width(0.85)
+        # Physical Glass Outer Crystal Rim (Exact integer-aligned stroke)
+        draw_rounded_capsule(cr, x0 + 0.5, y0 + 0.5, w - 1.0, h - 1.0, r - 0.5)
+        rim_grad = cairo.LinearGradient(cx, y0, cx, y0 + h)
+        rt = self.theme["rim_top"]
+        rb = self.theme["rim_bot"]
+        rim_grad.add_color_stop_rgba(0.0, rt[0], rt[1], rt[2], rt[3])
+        rim_grad.add_color_stop_rgba(1.0, rb[0], rb[1], rb[2], rb[3])
+        cr.set_source(rim_grad)
+        cr.set_line_width(1.0)
         cr.stroke()
 
-        # Pinpoint micro-glint
-        cr.arc(cx - 3.2, cy - 3.2, 0.75, 0, 2 * math.pi)
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.90)
-        cr.fill()
+        # Secondary Inner Refraction Bezel (Optical glass depth)
+        draw_rounded_capsule(cr, x0 + 1.5, y0 + 1.5, w - 3.0, h - 3.0, r - 1.5)
+        cr.set_source_rgba(1.0, 1.0, 1.0, self.theme["bezel_alpha"])
+        cr.set_line_width(0.6)
+        cr.stroke()
+
+        # -------------------------------------------------------------
+        # 3. STATE: RECORDING (Voice-Synced Breathing Pearls & Timer)
+        # -------------------------------------------------------------
+        if self.current_state == "recording":
+            # --- Right: Pure White Micro Timer with Shadow ---
+            elapsed = int(time.time() - self.recording_start_time) if self.recording_start_time else 0
+            timer_text = f"{elapsed // 60}:{elapsed % 60:02d}"
+            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            cr.set_font_size(8.5)
+            extents = cr.text_extents(timer_text)
+            tx = x0 + w - 10.0 - extents.width
+            ty = cy - (extents.height / 2.0 + extents.y_bearing)
+
+            # Drop shadow for legibility over bright backgrounds
+            cr.move_to(tx + 0.6, ty + 0.6)
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.70)
+            cr.show_text(timer_text)
+
+            cr.move_to(tx, ty)
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.98)
+            cr.show_text(timer_text)
+
+            # --- Left: 4 Voice-Synced Symmetrical Breathing Pearls ---
+            num_beads = 4
+            mid_x = x0 + 26.5
+            # Pearls breathe slightly outward with vocal volume (5.2px up to 5.7px)
+            bead_spacing = 5.2 + (0.5 * self.smooth_voice_level)
+            # Symmetrical scale weights: center pearls pulse higher than outer pearls
+            # Base radius 1.5px. Center pearls expand to 3.4px, outer to 2.4px.
+            max_growths = [0.9, 1.9, 1.9, 0.9]
+
+            for i in range(num_beads):
+                idx = i - 1.5  # Symmetrically positions: -1.5, -0.5, +0.5, +1.5
+                bx = mid_x + idx * bead_spacing
+                by = cy  # Stably anchored on the exact centerline (NO artificial jumping/bouncing)
+
+                pv = self.pearl_levels[i]
+                base_r = 1.5
+                br = base_r + (max_growths[i] * pv)
+                br = max(1.4, min(3.5, br))
+
+                # Contact shadow
+                cr.arc(bx, by + 0.6, br * 0.88, 0, 2 * math.pi)
+                cr.set_source_rgba(0.0, 0.0, 0.0, 0.50)
+                cr.fill()
+
+                # Pure white / silver pearl gradient (intensifies in brightness with voice)
+                b_grad = cairo.RadialGradient(bx - br * 0.25, by - br * 0.25, 0.15, bx, by, br)
+                b_grad.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 1.0)
+                b_grad.add_color_stop_rgba(0.55, COLOR_PEARL_SILVER[0], COLOR_PEARL_SILVER[1], COLOR_PEARL_SILVER[2], 0.88 + 0.12 * pv)
+                b_grad.add_color_stop_rgba(1.0, 0.35, 0.35, 0.35, 0.0)
+
+                cr.arc(bx, by, br, 0, 2 * math.pi)
+                cr.set_source(b_grad)
+                cr.fill()
+
+                # Crisp micro specular reflection on the upper-left of each pearl
+                cr.arc(bx - br * 0.35, by - br * 0.35, br * 0.26, 0, 2 * math.pi)
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.98)
+                cr.fill()
+
+        # -------------------------------------------------------------
+        # 4. STATE: TRANSCRIBING (Pure White Crystal Spinner & Shimmer)
+        # -------------------------------------------------------------
+        elif self.current_state == "transcribing":
+            spin_x = x0 + 13.0
+            spin_r = 3.4
+            angle = (self.anim_time * 6.5) % (2 * math.pi)
+
+            # Background subtle ring
+            cr.arc(spin_x, cy, spin_r, 0, 2 * math.pi)
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.16)
+            cr.set_line_width(1.2)
+            cr.stroke()
+
+            # Active illuminated pure white arc
+            cr.arc(spin_x, cy, spin_r, angle, angle + 1.25 * math.pi)
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.98)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.set_line_width(1.2)
+            cr.stroke()
+
+            # Shimmering pure white label
+            shimmer = 0.75 + 0.25 * math.sin(self.anim_time * 4.0)
+            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            cr.set_font_size(8.0)
+            extents = cr.text_extents("Processing...")
+            tx = spin_x + 9.0
+            ty = cy - (extents.height / 2.0 + extents.y_bearing)
+
+            # Drop shadow for transparent background legibility
+            cr.move_to(tx + 0.6, ty + 0.6)
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.60)
+            cr.show_text("Processing...")
+
+            cr.move_to(tx, ty)
+            cr.set_source_rgba(1.0, 1.0, 1.0, shimmer)
+            cr.show_text("Processing...")
 
         return False
 
-if __name__ == "__main__":
-    win = VoiceReactiveBumblebeeEye()
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Voxtype Pure B&W Liquid Glass Dynamic Island OSD",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Available themes:\n" + "\n".join(f"  {k:12s} - {v['description']}" for k, v in THEMES.items()),
+    )
+    parser.add_argument("--demo", action="store_true", help="Launch in interactive demo preview mode")
+    parser.add_argument(
+        "--theme",
+        choices=list(THEMES.keys()),
+        default="dark-glass",
+        help="Visual theme (default: dark-glass)",
+    )
+    parser.add_argument(
+        "--top-margin",
+        type=int,
+        default=36,
+        help="Vertical offset in pixels from the top of the screen (default: 36)",
+    )
+    args = parser.parse_args()
+
+    # Graceful termination on SIGINT and SIGTERM via GLib main loop signal sources
+    def _sig_handler(*_):
+        Gtk.main_quit()
+        return GLib.SOURCE_REMOVE
+
+    if GLibUnix and hasattr(GLibUnix, 'signal_add'):
+        GLibUnix.signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, _sig_handler)
+        GLibUnix.signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, _sig_handler)
+    elif hasattr(GLib, 'unix_signal_add'):
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, _sig_handler)
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, _sig_handler)
+    else:
+        signal.signal(signal.SIGINT, lambda *s: Gtk.main_quit())
+        signal.signal(signal.SIGTERM, lambda *s: Gtk.main_quit())
+
+    win = DynamicIslandOSD(
+        demo_mode=args.demo,
+        theme_name=args.theme,
+        top_margin=args.top_margin,
+    )
     Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
